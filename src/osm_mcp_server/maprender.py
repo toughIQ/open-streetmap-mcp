@@ -135,13 +135,18 @@ def _draw_overlay(
         draw.line(pts, fill=_color(route_color, "#1a73e8") + (255,), width=5 * scale, joint="curve")
 
     label_font = _font(14 * scale)
+    text_font = _font(15 * scale)
     for marker in markers:
         px, py = (v * scale for v in to_view(marker["latitude"], marker["longitude"]))
-        r = 9 * scale
+        text = marker.get("text")
+        r = (12 if text else 9) * scale
         fill = _color(marker.get("color"), "#d93025")
         draw.ellipse((px - r - 2 * scale, py - r - 2 * scale, px + r + 2 * scale, py + r + 2 * scale), fill=(255, 255, 255, 255))
         draw.ellipse((px - r, py - r, px + r, py + r), fill=fill + (255,))
-        draw.ellipse((px - 3 * scale, py - 3 * scale, px + 3 * scale, py + 3 * scale), fill=(255, 255, 255, 255))
+        if text:
+            draw.text((px, py), str(text), font=text_font, fill=(255, 255, 255, 255), anchor="mm")
+        else:
+            draw.ellipse((px - 3 * scale, py - 3 * scale, px + 3 * scale, py + 3 * scale), fill=(255, 255, 255, 255))
         label = marker.get("label")
         if label:
             draw.text(

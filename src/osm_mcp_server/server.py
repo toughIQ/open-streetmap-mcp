@@ -6,50 +6,59 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 import math
+import os
+import re
+import tempfile
+import time
 from datetime import datetime
+from pathlib import Path
 
-from . import maprender
+from . import maprender, routesheet
 
 ROUTING_BASE_URL = "https://routing.openstreetmap.de"
 
-_COMPASS = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
+def _describe_step(step: Dict[str, Any], mode: str = "car") -> str:
+    """Readable instruction for an OSRM step (OSRM does not provide text itself)."""
+    return routesheet.describe_step(step, "en", mode)
 
 
-def _describe_step(step: Dict[str, Any]) -> str:
-    """Build a readable instruction from an OSRM step (OSRM does not provide text itself)."""
-    maneuver = step.get("maneuver", {})
-    kind = maneuver.get("type", "")
-    modifier = maneuver.get("modifier", "")
-    name = step.get("name") or ""
-    onto = f" onto {name}" if name else ""
+_NUMBER_FIRST = {"gb", "us", "ca", "au", "ie", "nz"}
 
-    if kind == "depart":
-        bearing = maneuver.get("bearing_after")
-        heading = f" {_COMPASS[int(((bearing + 22.5) % 360) // 45)]}" if bearing is not None else ""
-        return f"Head{heading}" + (f" on {name}" if name else "")
-    if kind == "arrive":
-        side = f" ({modifier} side)" if modifier in ("left", "right") else ""
-        return "Arrive at your destination" + side + (f" on {name}" if name else "")
-    if kind in ("roundabout", "rotary", "roundabout turn"):
-        exit_no = maneuver.get("exit")
-        return (f"At the roundabout take exit {exit_no}" if exit_no else "Enter the roundabout") + onto
-    if kind in ("exit roundabout", "exit rotary"):
-        return "Exit the roundabout" + onto
-    if kind == "merge":
-        return f"Merge {modifier}".strip() + onto
-    if kind in ("on ramp", "off ramp"):
-        return f"Take the ramp {modifier}".strip() + onto
-    if kind == "fork":
-        return f"Keep {modifier} at the fork".strip() + onto
-    if kind in ("turn", "end of road"):
-        if modifier == "uturn":
-            return "Make a U-turn" + onto
-        if modifier == "straight":
-            return "Continue straight" + onto
-        return f"Turn {modifier}".strip() + onto
-    if kind in ("continue", "new name"):
-        return ("Continue straight" if modifier in ("", "straight") else f"Continue {modifier}") + onto
-    return f"{kind} {modifier}".strip().capitalize() + onto
+
+def simplify_address(addr: Dict[str, Any]) -> Dict[str, str]:
+    """Reduce a Nominatim address dict to the parts needed for a postal-style address."""
+    road = next((addr[k] for k in ("road", "pedestrian", "footway", "path", "square") if addr.get(k)), "")
+    city = next((addr[k] for k in ("city", "town", "village", "municipality", "hamlet", "suburb") if addr.get(k)), "")
+    return {
+        "road": road,
+        "house_number": addr.get("house_number", ""),
+        "postcode": addr.get("postcode", ""),
+        "city": city,
+        "country_code": addr.get("country_code", ""),
+    }
+
+
+def format_address(addr: Dict[str, str]) -> str:
+    road, number = addr.get("road", ""), addr.get("house_number", "")
+    if road and number:
+        street = f"{number} {road}" if addr.get("country_code") in _NUMBER_FIRST else f"{road} {number}"
+    else:
+        street = road
+    locality = " ".join(x for x in (addr.get("postcode", ""), addr.get("city", "")) if x)
+    return ", ".join(x for x in (street, locality) if x)
+
+
+def _candidate(name: str, lat: float, lon: float, addr: Dict[str, str], osm: str, category: str, source: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "formatted_address": format_address(addr),
+        "address": addr,
+        "latitude": lat,
+        "longitude": lon,
+        "osm": osm,
+        "category": category,
+        "source": source,
+    }
 
 
 class OSMClient:
@@ -57,6 +66,8 @@ class OSMClient:
         self.base_url = base_url
         self.session = None
         self.cache = {}  # Simple in-memory cache
+        self._nominatim_lock = asyncio.Lock()
+        self._last_nominatim = 0.0
     
     async def connect(self):
         self.session = aiohttp.ClientSession(headers={"User-Agent": maprender.USER_AGENT})
@@ -70,6 +81,7 @@ class OSMClient:
         if not self.session:
             raise RuntimeError("OSM client not connected")
         
+        await self._throttle()
         nominatim_url = "https://nominatim.openstreetmap.org/search"
         async with self.session.get(
             nominatim_url,
@@ -90,6 +102,7 @@ class OSMClient:
         if not self.session:
             raise RuntimeError("OSM client not connected")
         
+        await self._throttle()
         nominatim_url = "https://nominatim.openstreetmap.org/reverse"
         async with self.session.get(
             nominatim_url,
@@ -104,6 +117,136 @@ class OSMClient:
                 return await response.json()
             else:
                 raise Exception(f"Failed to reverse geocode ({lat}, {lon}): {response.status}")
+
+    async def _throttle(self):
+        """Nominatim usage policy: at most one request per second."""
+        async with self._nominatim_lock:
+            wait = self._last_nominatim + 1.1 - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_nominatim = time.monotonic()
+
+    async def _nominatim_search(self, query: str, limit: int = 5, viewbox: Optional[Tuple[float, float, float, float]] = None) -> List[Dict]:
+        if not self.session:
+            raise RuntimeError("OSM client not connected")
+        await self._throttle()
+        params = {"q": query, "format": "json", "limit": limit, "addressdetails": 1}
+        if viewbox:
+            params["viewbox"] = ",".join(str(v) for v in viewbox)
+            params["bounded"] = 1
+        async with self.session.get("https://nominatim.openstreetmap.org/search", params=params) as response:
+            if response.status == 200:
+                return await response.json()
+            raise Exception(f"Place search failed for '{query}': {response.status}")
+
+    @staticmethod
+    def _from_nominatim(hit: Dict, source: str) -> Dict[str, Any]:
+        name = hit.get("name") or hit.get("display_name", "").split(",")[0]
+        cand = _candidate(
+            name, float(hit["lat"]), float(hit["lon"]), simplify_address(hit.get("address", {})),
+            f"{hit.get('osm_type')}/{hit.get('osm_id')}", f"{hit.get('class')}={hit.get('type')}", source,
+        )
+        cand["display_name"] = hit.get("display_name", "")
+        return cand
+
+    async def _overpass_name_search(self, query: str, viewbox: Tuple[float, float, float, float],
+                                    area_tokens: set, limit: int, area_relation: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Fuzzy fallback: every remaining word of the query must appear in the OSM name."""
+        tokens = [w for w in re.findall(r"\w+", query) if len(w) >= 3 and w.lower() not in area_tokens]
+        if not tokens:
+            return []
+        west, north, east, south = viewbox
+        filters = "".join(f'["name"~"{tok}",i]' for tok in tokens)
+        if area_relation:
+            ql = f"[out:json][timeout:25];area(id:{3600000000 + area_relation})->.a;nwr{filters}(area.a);out center tags {limit * 3};"
+        else:
+            ql = f"[out:json][timeout:25];nwr{filters}({south},{west},{north},{east});out center tags {limit * 3};"
+        async with self.session.post("https://overpass-api.de/api/interpreter", data={"data": ql}) as response:
+            if response.status != 200:
+                raise Exception(f"Overpass name search failed: {response.status}")
+            elements = (await response.json()).get("elements", [])
+        found = []
+        for el in elements:
+            tags = el.get("tags", {})
+            lat = el.get("lat") if el.get("lat") is not None else el.get("center", {}).get("lat")
+            lon = el.get("lon") if el.get("lon") is not None else el.get("center", {}).get("lon")
+            if lat is None or lon is None:
+                continue
+            addr = {
+                "road": tags.get("addr:street", ""), "house_number": tags.get("addr:housenumber", ""),
+                "postcode": tags.get("addr:postcode", ""), "city": tags.get("addr:city", ""), "country_code": "",
+            }
+            category = next((f"{k}={tags[k]}" for k in ("amenity", "tourism", "shop", "leisure", "office", "building") if k in tags), "")
+            found.append(_candidate(tags.get("name", ""), lat, lon, addr, f"{el.get('type')}/{el.get('id')}", category, "overpass name search"))
+        found.sort(key=lambda c: len(c["name"]))
+        return found[:limit]
+
+    async def search_places(self, query: str, area: Optional[str] = None, limit: int = 5) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Find places by name or address. With an area (e.g. a town) the search is limited to it and falls back to a fuzzy name search."""
+        notes: List[str] = []
+        viewbox = None
+        area_relation: Optional[int] = None
+        area_tokens: set = set()
+        area_name = ""
+        if area:
+            area_tokens = {w.lower() for w in re.findall(r"\w+", area)}
+            area_name = area.split(",")[0].strip().lower()
+            hits = await self._nominatim_search(area, limit=1)
+            if hits and hits[0].get("boundingbox"):
+                south, north, west, east = (float(v) for v in hits[0]["boundingbox"])
+                viewbox = (west, north, east, south)
+                if hits[0].get("osm_type") == "relation":
+                    area_relation = int(hits[0]["osm_id"])
+            else:
+                notes.append(f"Area '{area}' was not found, searching without it.")
+
+        def in_area(hit: Dict) -> bool:
+            # the bounding box of a town overlaps its neighbours, so check the address too
+            return not area_name or area_name in hit.get("display_name", "").lower()
+
+        if viewbox:
+            hits = [h for h in await self._nominatim_search(query, limit * 3, viewbox) if in_area(h)][:limit]
+            if hits:
+                return [self._from_nominatim(h, "nominatim, inside area") for h in hits], notes
+        if area:
+            hits = [h for h in await self._nominatim_search(f"{query}, {area}", limit * 3) if in_area(h)][:limit]
+            if hits:
+                return [self._from_nominatim(h, "nominatim, query plus area") for h in hits], notes
+        if viewbox:
+            try:
+                found = await self._overpass_name_search(query, viewbox, area_tokens, limit, area_relation)
+                if found:
+                    notes.append("Found by fuzzy name search (Overpass), check the name.")
+                    return found, notes
+            except Exception as e:
+                notes.append(f"Fuzzy name search failed: {e}")
+        if viewbox:
+            return [], notes  # an area was given and found: do not silently pick a place elsewhere
+        hits = await self._nominatim_search(query, limit)
+        return [self._from_nominatim(h, "nominatim") for h in hits], notes
+
+    async def resolve_place(self, query: str, area: Optional[str] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+        """Resolve text or "lat,lon" to one place with a checked address. Returns (best, alternatives, notes)."""
+        match = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*[,;]\s*(-?\d+(?:\.\d+)?)\s*", query)
+        notes: List[str] = []
+        if match:
+            lat, lon = float(match.group(1)), float(match.group(2))
+            best = _candidate(f"{lat:.5f}, {lon:.5f}", lat, lon, {}, "", "coordinates", "coordinates")
+            alternatives: List[Dict[str, Any]] = []
+        else:
+            found, notes = await self.search_places(query, area)
+            if not found:
+                raise ValueError(f"No place found for '{query}'" + (f" in '{area}'" if area else ""))
+            best, alternatives = found[0], found[1:]
+
+        if not best["address"].get("road"):
+            reverse = await self.reverse_geocode(best["latitude"], best["longitude"])
+            filled = simplify_address(reverse.get("address", {}))
+            best["address"] = {**filled, **{k: v for k, v in best["address"].items() if v}}
+            best["formatted_address"] = format_address(best["address"])
+            if best["category"] == "coordinates":
+                best["name"] = best["formatted_address"] or best["name"]
+        return best, alternatives, notes
 
     async def get_route(self, 
                          from_lat: float, 
@@ -400,7 +543,7 @@ async def get_route_directions(
     ctx: Context,
     mode: str = "car",
     steps: bool = True,
-    overview: str = "simplified",
+    overview: Union[str, bool] = "simplified",
     annotations: bool = False
 ) -> Dict[str, Any]:
     """
@@ -436,6 +579,9 @@ async def get_route_directions(
         }
     """
     osm_client = ctx.request_context.lifespan_context.osm_client
+
+    if overview is False or overview is True:
+        overview = "full" if overview else "false"
     
     # Validate transportation mode
     valid_modes = ["car", "bike", "foot"]
@@ -465,10 +611,11 @@ async def get_route_directions(
             for leg in route["legs"]:
                 for step in leg.get("steps", []):
                     steps_list.append({
-                        "instruction": _describe_step(step),
+                        "instruction": _describe_step(step, mode),
                         "distance": step.get("distance"),
                         "duration": step.get("duration"),
-                        "name": step.get("name", "")
+                        "name": step.get("name", ""),
+                        "location": step.get("maneuver", {}).get("location")
                     })
         
         return {
@@ -1054,7 +1201,7 @@ async def analyze_commute(
                     for leg in route["legs"]:
                         for step in leg.get("steps", []):
                             steps.append({
-                                "instruction": _describe_step(step),
+                                "instruction": _describe_step(step, mode),
                                 "distance": step.get("distance"),
                                 "duration": step.get("duration"),
                                 "name": step.get("name", "")
@@ -1680,7 +1827,8 @@ async def render_static_map(
         max_longitude: Eastern edge of a bounding box
         width: Image width in pixels (64-2400)
         height: Image height in pixels (64-2400)
-        markers: Optional list of {"latitude": float, "longitude": float, "label": str (optional),
+        markers: Optional list of {"latitude": float, "longitude": float, "label": str (optional, text
+                 next to the pin), "text": str (optional, short text inside a larger pin, e.g. "A" or "3"),
                  "color": str (optional, e.g. "red" or "#d93025")}
         route: Optional route line, a GeoJSON LineString or a list of [longitude, latitude] pairs
         route_color: Color of the route line
@@ -1766,6 +1914,187 @@ async def render_route_map(
     )
     rendered["route"] = {"distance_m": route.get("distance"), "duration_s": route.get("duration"), "mode": mode}
     return rendered
+
+@mcp.tool()
+async def find_place(
+    query: str,
+    ctx: Context,
+    area: Optional[str] = None,
+    limit: int = 5
+) -> Dict[str, Any]:
+    """
+    Find a place by name or address and check its address (street, house number, postcode, town).
+
+    Use this to confirm a place before routing or printing. With an area (a town or district) the
+    search is limited to it, and if the exact name does not match, a fuzzy name search inside the
+    area is tried, so "Pfadfinder" finds "Pfadfinderheim Koenigstetten". Short exact names work best.
+    The first result is the best guess, the rest are alternatives.
+
+    Args:
+        query: Name or address, e.g. "Pfarrkirche" or "Wipfinger Strasse 21". "lat,lon" is also accepted.
+        area: Optional town or district to search in, e.g. "Koenigstetten, Austria"
+        limit: Maximum number of results (default 5)
+
+    Returns:
+        Results with name, formatted_address (empty parts mean OSM does not have them), coordinates,
+        OSM id, category and which search method found it, plus notes.
+    """
+    osm_client = ctx.request_context.lifespan_context.osm_client
+    best, alternatives, notes = await osm_client.resolve_place(query, area)
+    results = [best] + alternatives[: max(limit - 1, 0)]
+    if not best["address"].get("house_number"):
+        notes.append("The best match has no house number in OpenStreetMap.")
+    return {"query": query, "area": area, "results": results, "notes": notes}
+
+@mcp.tool()
+async def create_route_printout(
+    from_place: str,
+    to_place: str,
+    output_path: str,
+    ctx: Context,
+    area: Optional[str] = None,
+    mode: str = "foot",
+    language: str = "en",
+    title: Optional[str] = None,
+    width: int = 1000,
+    height: int = 760,
+    save_map_png: bool = True
+) -> Dict[str, Any]:
+    """
+    Make a printable A4 PDF route sheet: a colored map of the route, the checked addresses of start
+    and destination, and numbered step-by-step directions that match numbered markers on the map.
+    One call does the place search, address check, routing and printout.
+
+    The map shows the route line, a green A at the start, a red B at the destination and blue numbered
+    points at every turn. Runs of tiny unnamed path pieces are merged into one step and unnamed paths
+    are called out as such. If the route ends on a different street than the destination's address,
+    the sheet says so.
+
+    Args:
+        from_place: Start, a name or address (e.g. "Pfadfinderheim") or "lat,lon"
+        to_place: Destination, a name or address (e.g. "Pfarrkirche St. Jakob") or "lat,lon"
+        output_path: Where to save the PDF. Must end in .pdf. Parent folders are created.
+        area: Town or district that both places are in (e.g. "Koenigstetten, Austria"). Strongly
+              recommended, it limits the search and enables the fuzzy name fallback.
+        mode: "foot" (default), "bike" or "car"
+        language: "en" (default) or "de" for the directions and labels on the sheet
+        title: Optional sheet title. Default is built from the two place names.
+        width: Map image width in pixels (64-2400)
+        height: Map image height in pixels (64-2400)
+        save_map_png: Also save the map as a PNG next to the PDF (same name, .png) for use in documents
+
+    Returns:
+        PDF path, optional PNG path, both resolved places with addresses (check them!), alternatives that
+        were not used, distance and duration, the numbered steps, and notes.
+    """
+    if mode not in ("foot", "bike", "car"):
+        raise ValueError("mode must be 'foot', 'bike' or 'car'")
+    if language not in ("en", "de"):
+        raise ValueError("language must be 'en' or 'de'")
+    out = Path(output_path).expanduser()
+    if out.suffix.lower() != ".pdf":
+        raise ValueError("output_path must end in .pdf")
+
+    osm_client = ctx.request_context.lifespan_context.osm_client
+    start, start_alternatives, start_notes = await osm_client.resolve_place(from_place, area)
+    end, end_alternatives, end_notes = await osm_client.resolve_place(to_place, area)
+
+    route_data = await osm_client.get_route(
+        start["latitude"], start["longitude"], end["latitude"], end["longitude"],
+        mode, steps=True, overview="full", annotations=False
+    )
+    if not route_data.get("routes"):
+        raise Exception("No route found between the two places")
+    route = route_data["routes"][0]
+    steps = routesheet.build_steps(route, language, mode)
+
+    markers = []
+    for step in steps[1:-1]:
+        if step.get("location"):
+            markers.append({"latitude": step["location"][1], "longitude": step["location"][0],
+                            "text": step["label"], "color": routesheet.COLOR_STEP})
+    markers.append({"latitude": start["latitude"], "longitude": start["longitude"], "text": "A",
+                    "color": routesheet.COLOR_START, "label": start["name"]})
+    markers.append({"latitude": end["latitude"], "longitude": end["longitude"], "text": "B",
+                    "color": routesheet.COLOR_END, "label": end["name"]})
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if save_map_png:
+        map_path = out.with_suffix(".png")
+    else:
+        handle, tmp_name = tempfile.mkstemp(suffix=".png")
+        os.close(handle)
+        map_path = Path(tmp_name)
+
+    detail_path: Optional[Path] = None
+    try:
+        rendered = await maprender.render(
+            str(map_path), width=width, height=height, markers=markers, route=route.get("geometry")
+        )
+
+        # numbered points that overlap at this zoom get a zoomed-in detail map
+        placed = [(m, maprender.world_px(m["latitude"], m["longitude"], rendered["zoom"])) for m in markers]
+        crowded_set = set()
+        for i in range(len(placed)):
+            for j in range(i + 1, len(placed)):
+                if math.hypot(placed[i][1][0] - placed[j][1][0], placed[i][1][1] - placed[j][1][1]) < 28:
+                    crowded_set.update((i, j))
+        crowded = sorted(crowded_set)
+        detail_size = (1000, 420)
+        if len(crowded) >= 2:
+            points = [(placed[i][0]["latitude"], placed[i][0]["longitude"]) for i in crowded]
+            lats, lons = [p[0] for p in points], [p[1] for p in points]
+            if save_map_png:
+                detail_path = out.with_name(out.stem + "_detail.png")
+            else:
+                handle, tmp_name = tempfile.mkstemp(suffix=".png")
+                os.close(handle)
+                detail_path = Path(tmp_name)
+            await maprender.render(
+                str(detail_path), width=detail_size[0], height=detail_size[1],
+                bbox=(min(lats), min(lons), max(lats), max(lons)),
+                zoom=min(maprender.fit_zoom(points, detail_size[0], detail_size[1], padding=70), 18),
+                markers=markers, route=route.get("geometry"),
+            )
+
+        waypoints = route_data.get("waypoints", [])
+        snap = waypoints[-1].get("distance") if waypoints else None
+        note = routesheet.arrival_note(steps[-1].get("name", ""), end["address"].get("road"), snap, language)
+        no_number = routesheet.T[language]["no_housenumber"]
+
+        def info(place: Dict[str, Any], extra: str = "") -> Dict[str, str]:
+            address = place["formatted_address"] or "-"
+            if place["address"].get("road") and not place["address"].get("house_number"):
+                extra = (extra + " (" + no_number + ")").strip()
+            return {"name": place["name"], "address": address, "note": extra}
+
+        label = title or f"{start['name']} - {end['name']}"
+        await asyncio.to_thread(
+            routesheet.build_pdf, str(out), str(map_path), (width, height), label, language, mode,
+            route.get("distance", 0.0), route.get("duration", 0.0),
+            info(start), {**info(end), "note": (note + " " + info(end)["note"]).strip()}, steps,
+            str(detail_path) if detail_path else None, detail_size if detail_path else None,
+        )
+    finally:
+        if not save_map_png:
+            map_path.unlink(missing_ok=True)
+            if detail_path:
+                detail_path.unlink(missing_ok=True)
+
+    return {
+        "pdf_path": str(out.resolve()),
+        "map_png_path": rendered["output_path"] if save_map_png else None,
+        "detail_map_png_path": str(detail_path.resolve()) if detail_path and save_map_png else None,
+        "mode": mode,
+        "distance_m": route.get("distance"),
+        "duration_s": route.get("duration"),
+        "from": start,
+        "to": end,
+        "alternatives_not_used": {"from": [c["name"] for c in start_alternatives], "to": [c["name"] for c in end_alternatives]},
+        "steps": [{"label": s["label"], "text": s["text"], "distance_m": round(s["distance"], 1)} for s in steps],
+        "map": {k: rendered[k] for k in ("zoom", "bbox")},
+        "notes": start_notes + end_notes + ([note] if note else []),
+    }
 
 if __name__ == "__main__":
     mcp.run()
