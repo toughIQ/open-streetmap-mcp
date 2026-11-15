@@ -8,6 +8,49 @@ from contextlib import asynccontextmanager
 import math
 from datetime import datetime
 
+from . import maprender
+
+ROUTING_BASE_URL = "https://routing.openstreetmap.de"
+
+_COMPASS = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
+
+
+def _describe_step(step: Dict[str, Any]) -> str:
+    """Build a readable instruction from an OSRM step (OSRM does not provide text itself)."""
+    maneuver = step.get("maneuver", {})
+    kind = maneuver.get("type", "")
+    modifier = maneuver.get("modifier", "")
+    name = step.get("name") or ""
+    onto = f" onto {name}" if name else ""
+
+    if kind == "depart":
+        bearing = maneuver.get("bearing_after")
+        heading = f" {_COMPASS[int(((bearing + 22.5) % 360) // 45)]}" if bearing is not None else ""
+        return f"Head{heading}" + (f" on {name}" if name else "")
+    if kind == "arrive":
+        side = f" ({modifier} side)" if modifier in ("left", "right") else ""
+        return "Arrive at your destination" + side + (f" on {name}" if name else "")
+    if kind in ("roundabout", "rotary", "roundabout turn"):
+        exit_no = maneuver.get("exit")
+        return (f"At the roundabout take exit {exit_no}" if exit_no else "Enter the roundabout") + onto
+    if kind in ("exit roundabout", "exit rotary"):
+        return "Exit the roundabout" + onto
+    if kind == "merge":
+        return f"Merge {modifier}".strip() + onto
+    if kind in ("on ramp", "off ramp"):
+        return f"Take the ramp {modifier}".strip() + onto
+    if kind == "fork":
+        return f"Keep {modifier} at the fork".strip() + onto
+    if kind in ("turn", "end of road"):
+        if modifier == "uturn":
+            return "Make a U-turn" + onto
+        if modifier == "straight":
+            return "Continue straight" + onto
+        return f"Turn {modifier}".strip() + onto
+    if kind in ("continue", "new name"):
+        return ("Continue straight" if modifier in ("", "straight") else f"Continue {modifier}") + onto
+    return f"{kind} {modifier}".strip().capitalize() + onto
+
 
 class OSMClient:
     def __init__(self, base_url="https://api.openstreetmap.org/api/0.6"):
@@ -16,7 +59,7 @@ class OSMClient:
         self.cache = {}  # Simple in-memory cache
     
     async def connect(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(headers={"User-Agent": maprender.USER_AGENT})
         
     async def disconnect(self):
         if self.session:
@@ -68,15 +111,18 @@ class OSMClient:
                          to_lat: float, 
                          to_lon: float,
                          mode: str = "car",
-                         steps: bool = False,
-                         overview: str = "overview",
-                         annotations: bool = True) -> Dict:
+                         steps: bool = True,
+                         overview: str = "simplified",
+                         annotations: bool = False) -> Dict:
         """Get routing information between two points"""
         if not self.session:
             raise RuntimeError("OSM client not connected")
         
-        # Use OSRM for routing
-        osrm_url = f"http://router.project-osrm.org/route/v1/{mode}/{from_lon},{from_lat};{to_lon},{to_lat}"
+        # FOSSGIS OSRM instances have separate car/bike/foot servers. The profile in the
+        # URL path is always "driving"; the server (routed-car/bike/foot) selects the profile.
+        if mode not in ("car", "bike", "foot"):
+            raise ValueError(f"Unsupported mode '{mode}'")
+        osrm_url = f"{ROUTING_BASE_URL}/routed-{mode}/route/v1/driving/{from_lon},{from_lat};{to_lon},{to_lat}"
         params = {
             "overview": overview,
             "geometries": "geojson",
@@ -353,7 +399,7 @@ async def get_route_directions(
     to_longitude: float,
     ctx: Context,
     mode: str = "car",
-    steps: bool = False,
+    steps: bool = True,
     overview: str = "simplified",
     annotations: bool = False
 ) -> Dict[str, Any]:
@@ -370,7 +416,7 @@ async def get_route_directions(
         to_longitude: Destination longitude (decimal degrees)
         ctx: Context (provided internally by MCP)
         mode: Transportation mode ("car", "bike", "foot")
-        steps: Turn-by-turn instructions (True/False, Default: False)
+        steps: Turn-by-turn instructions (True/False, Default: True)
         overview: Geometry output ("full", "simplified", "false"; Default: "simplified")
         annotations: Additional segment info (True/False, Default: False)
     
@@ -419,7 +465,7 @@ async def get_route_directions(
             for leg in route["legs"]:
                 for step in leg.get("steps", []):
                     steps_list.append({
-                        "instruction": step.get("maneuver", {}).get("instruction", ""),
+                        "instruction": _describe_step(step),
                         "distance": step.get("distance"),
                         "duration": step.get("duration"),
                         "name": step.get("name", "")
@@ -788,7 +834,7 @@ async def get_map_style(style: str, z: int, x: int, y: int) -> Tuple[bytes, str]
     
     tile_url = tile_servers[style].replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
     
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers={"User-Agent": maprender.USER_AGENT}) as session:
         async with session.get(tile_url) as response:
             if response.status == 200:
                 tile_data = await response.read()
@@ -1008,7 +1054,7 @@ async def analyze_commute(
                     for leg in route["legs"]:
                         for step in leg.get("steps", []):
                             steps.append({
-                                "instruction": step.get("maneuver", {}).get("instruction", ""),
+                                "instruction": _describe_step(step),
                                 "distance": step.get("distance"),
                                 "duration": step.get("duration"),
                                 "name": step.get("name", "")
@@ -1594,6 +1640,132 @@ async def find_parking_facilities(
         "parking_facilities": results,
         "count": len(results)
     }
+
+@mcp.tool()
+async def render_static_map(
+    output_path: str,
+    ctx: Context,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    zoom: Optional[int] = None,
+    min_latitude: Optional[float] = None,
+    min_longitude: Optional[float] = None,
+    max_latitude: Optional[float] = None,
+    max_longitude: Optional[float] = None,
+    width: int = 800,
+    height: int = 600,
+    markers: Optional[List[Dict[str, Any]]] = None,
+    route: Optional[Any] = None,
+    route_color: str = "#1a73e8"
+) -> Dict[str, Any]:
+    """
+    Render a map image (PNG/JPEG) from OpenStreetMap tiles and save it to a file, e.g. for
+    embedding in a PDF or document.
+
+    The map area is chosen in this order: a bounding box (min/max latitude/longitude), else a
+    center (latitude/longitude) with an optional zoom (default 15), else fitted automatically
+    around the given markers and route. An "(c) OpenStreetMap contributors" attribution is drawn
+    on the image and must be kept when publishing.
+
+    Args:
+        output_path: Where to save the image. Must end in .png, .jpg or .jpeg. Parent folders
+                     are created. Relative paths resolve against the server's working directory.
+        latitude: Center latitude (use together with longitude)
+        longitude: Center longitude
+        zoom: Zoom level 0-19 (about 15 = streets, 12 = city district, 10 = city). Auto if omitted
+              with a bounding box or markers.
+        min_latitude: Southern edge of a bounding box
+        min_longitude: Western edge of a bounding box
+        max_latitude: Northern edge of a bounding box
+        max_longitude: Eastern edge of a bounding box
+        width: Image width in pixels (64-2400)
+        height: Image height in pixels (64-2400)
+        markers: Optional list of {"latitude": float, "longitude": float, "label": str (optional),
+                 "color": str (optional, e.g. "red" or "#d93025")}
+        route: Optional route line, a GeoJSON LineString or a list of [longitude, latitude] pairs
+        route_color: Color of the route line
+
+    Returns:
+        Saved file path, zoom level, and the exact bounding box shown on the image.
+    """
+    bbox = None
+    if None not in (min_latitude, min_longitude, max_latitude, max_longitude):
+        bbox = (min_latitude, min_longitude, max_latitude, max_longitude)
+    center = (latitude, longitude) if latitude is not None and longitude is not None else None
+
+    return await maprender.render(
+        output_path,
+        width=width,
+        height=height,
+        center=center,
+        zoom=zoom,
+        bbox=bbox,
+        markers=markers,
+        route=route,
+        route_color=route_color,
+    )
+
+@mcp.tool()
+async def render_route_map(
+    from_latitude: float,
+    from_longitude: float,
+    to_latitude: float,
+    to_longitude: float,
+    output_path: str,
+    ctx: Context,
+    mode: str = "car",
+    width: int = 800,
+    height: int = 600,
+    from_label: Optional[str] = "Start",
+    to_label: Optional[str] = "End",
+    route_color: str = "#1a73e8"
+) -> Dict[str, Any]:
+    """
+    Calculate a route between two points and save a map image of it (route line plus start and
+    end markers), fitted automatically to the route. Handy for adding directions maps to a PDF
+    or document. An "(c) OpenStreetMap contributors" attribution is drawn on the image.
+
+    Args:
+        from_latitude: Start latitude
+        from_longitude: Start longitude
+        to_latitude: Destination latitude
+        to_longitude: Destination longitude
+        output_path: Where to save the image (.png, .jpg or .jpeg)
+        mode: "car", "bike" or "foot"
+        width: Image width in pixels (64-2400)
+        height: Image height in pixels (64-2400)
+        from_label: Label next to the start marker
+        to_label: Label next to the end marker
+        route_color: Color of the route line
+
+    Returns:
+        Saved file path, route distance (m) and duration (s), zoom level, and the bounding box shown.
+    """
+    if mode not in ("car", "bike", "foot"):
+        raise ValueError("mode must be 'car', 'bike' or 'foot'")
+    osm_client = ctx.request_context.lifespan_context.osm_client
+
+    route_data = await osm_client.get_route(
+        from_latitude, from_longitude, to_latitude, to_longitude,
+        mode, steps=False, overview="full", annotations=False
+    )
+    if not route_data.get("routes"):
+        raise Exception("No route found")
+    route = route_data["routes"][0]
+
+    rendered = await maprender.render(
+        output_path,
+        width=width,
+        height=height,
+        markers=[
+            {"latitude": from_latitude, "longitude": from_longitude, "label": from_label, "color": "#1e8e3e"},
+            {"latitude": to_latitude, "longitude": to_longitude, "label": to_label, "color": "#d93025"},
+        ],
+        route=route.get("geometry"),
+        route_color=route_color,
+    )
+    rendered["route"] = {"distance_m": route.get("distance"), "duration_s": route.get("duration"), "mode": mode}
+    return rendered
 
 if __name__ == "__main__":
     mcp.run()

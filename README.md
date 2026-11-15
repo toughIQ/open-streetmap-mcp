@@ -66,11 +66,21 @@ The server implements several geospatial tools:
 - `suggest_meeting_point`: Find optimal meeting spots for multiple people
 - `explore_area`: Get comprehensive data about a neighborhood
 - `find_schools_nearby`: Locate educational institutions near a specific location
+- `render_static_map`: Render a map image (PNG/JPEG) from OSM tiles with markers and a route line, saved to a file for PDFs and docs
+- `render_route_map`: Compute a route (car, bike, foot) and save a map image of it
 - `analyze_commute`: Compare transportation options between home and work
 - `find_ev_charging_stations`: Locate EV charging infrastructure with filtering
 - `analyze_neighborhood`: Evaluate neighborhood livability for real estate
 - `find_parking_facilities`: Locate parking options near a destination
 
+
+## Fork changes (toughIQ)
+
+- New tools `render_static_map` and `render_route_map` (Pillow, no extra services). Tiles are cached in `~/.cache/osm-mcp-server/tiles` and fetched with at most 2 connections, as the OSM tile usage policy asks.
+- Routing now uses `routing.openstreetmap.de` (separate car, bike and foot profiles) and turn-by-turn steps get readable text.
+- A real User-Agent is sent. Override with `OSM_MCP_USER_AGENT`. Other env vars: `OSM_MCP_TILE_URL`, `OSM_MCP_CACHE_DIR`.
+- Dependencies are pinned to exact versions.
+- Keep the "(c) OpenStreetMap contributors" attribution on published maps. It is drawn on the images by default.
 
 ## Local Testing
 
