@@ -79,7 +79,8 @@ The server implements several geospatial tools:
 - New tools `render_static_map` and `render_route_map` (Pillow, no extra services). Tiles are cached in `~/.cache/osm-mcp-server/tiles` and fetched with at most 2 connections, as the OSM tile usage policy asks.
 - Routing now uses `routing.openstreetmap.de` (separate car, bike and foot profiles) and turn-by-turn steps get readable text.
 - A real User-Agent is sent. Override with `OSM_MCP_USER_AGENT`. Other env vars: `OSM_MCP_TILE_URL`, `OSM_MCP_CACHE_DIR`.
-- Dependencies are pinned to exact versions.
+- Dependencies are pinned to exact versions. `constraints.txt` (exported from `uv.lock`) freezes the transitive ones too, because `uv tool install` ignores `uv.lock` and mcp 1.3.0 breaks with current pydantic. Install with:
+  `uv tool install -c constraints.txt .` (run inside a checkout, non-editable), then use `osm-mcp-server` as the MCP command.
 - Keep the "(c) OpenStreetMap contributors" attribution on published maps. It is drawn on the images by default.
 
 ## Local Testing
