@@ -16,6 +16,10 @@ from pathlib import Path
 from . import maprender, routesheet
 
 ROUTING_BASE_URL = "https://routing.openstreetmap.de"
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 
 def _describe_step(step: Dict[str, Any], mode: str = "car") -> str:
     """Readable instruction for an OSRM step (OSRM does not provide text itself)."""
@@ -68,6 +72,7 @@ class OSMClient:
         self.cache = {}  # Simple in-memory cache
         self._nominatim_lock = asyncio.Lock()
         self._last_nominatim = 0.0
+        self._overpass_lock = asyncio.Lock()
     
     async def connect(self):
         self.session = aiohttp.ClientSession(headers={"User-Agent": maprender.USER_AGENT})
@@ -149,6 +154,23 @@ class OSMClient:
         cand["display_name"] = hit.get("display_name", "")
         return cand
 
+    async def _overpass_post(self, ql: str, attempts: int = 3) -> Dict[str, Any]:
+        """One request at a time (public servers limit slots per IP), retry on 429/504, then try a mirror."""
+        last_error = "no attempt made"
+        timeout = aiohttp.ClientTimeout(total=40)
+        async with self._overpass_lock:
+            for attempt in range(attempts):
+                for url in OVERPASS_ENDPOINTS:
+                    try:
+                        async with self.session.post(url, data={"data": ql}, timeout=timeout) as response:
+                            if response.status == 200:
+                                return await response.json()
+                            last_error = f"{url} answered HTTP {response.status}"
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        last_error = f"{url}: {type(e).__name__}"
+                await asyncio.sleep(2 * (attempt + 1))
+        raise Exception(f"Overpass not available ({last_error})")
+
     async def _overpass_name_search(self, query: str, viewbox: Tuple[float, float, float, float],
                                     area_tokens: set, limit: int, area_relation: Optional[int] = None) -> List[Dict[str, Any]]:
         """Fuzzy fallback: every remaining word of the query must appear in the OSM name."""
@@ -161,10 +183,7 @@ class OSMClient:
             ql = f"[out:json][timeout:25];area(id:{3600000000 + area_relation})->.a;nwr{filters}(area.a);out center tags {limit * 3};"
         else:
             ql = f"[out:json][timeout:25];nwr{filters}({south},{west},{north},{east});out center tags {limit * 3};"
-        async with self.session.post("https://overpass-api.de/api/interpreter", data={"data": ql}) as response:
-            if response.status != 200:
-                raise Exception(f"Overpass name search failed: {response.status}")
-            elements = (await response.json()).get("elements", [])
+        elements = (await self._overpass_post(ql)).get("elements", [])
         found = []
         for el in elements:
             tags = el.get("tags", {})
@@ -236,7 +255,8 @@ class OSMClient:
         else:
             found, notes = await self.search_places(query, area)
             if not found:
-                raise ValueError(f"No place found for '{query}'" + (f" in '{area}'" if area else ""))
+                reason = f" ({' '.join(notes)})" if notes else ""
+                raise ValueError(f"No place found for '{query}'" + (f" in '{area}'" if area else "") + reason)
             best, alternatives = found[0], found[1:]
 
         if not best["address"].get("road"):
