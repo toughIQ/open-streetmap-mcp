@@ -17,9 +17,11 @@ from . import maprender, routesheet
 
 ROUTING_BASE_URL = "https://routing.openstreetmap.de"
 OVERPASS_ENDPOINTS = [
+    "https://overpass.openstreetmap.fr/api/interpreter",
     "https://overpass-api.de/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
+OVERPASS_BUDGET_S = 75
 
 def _describe_step(step: Dict[str, Any], mode: str = "car") -> str:
     """Readable instruction for an OSRM step (OSRM does not provide text itself)."""
@@ -27,6 +29,13 @@ def _describe_step(step: Dict[str, Any], mode: str = "car") -> str:
 
 
 _NUMBER_FIRST = {"gb", "us", "ca", "au", "ie", "nz"}
+
+
+def _safe_osm_key(value: str) -> str:
+    """OSM keys and values go into Overpass queries, allow only plain tag characters."""
+    if not isinstance(value, str) or not re.fullmatch(r"[\w\-:]+", value):
+        raise ValueError(f"'{value}' is not a valid OSM key or value (letters, digits, _ - : only)")
+    return value
 
 
 def simplify_address(addr: Dict[str, Any]) -> Dict[str, str]:
@@ -154,21 +163,30 @@ class OSMClient:
         cand["display_name"] = hit.get("display_name", "")
         return cand
 
-    async def _overpass_post(self, ql: str, attempts: int = 3) -> Dict[str, Any]:
-        """One request at a time (public servers limit slots per IP), retry on 429/504, then try a mirror."""
+    async def _overpass_post(self, ql: str, attempts: int = 2) -> Dict[str, Any]:
+        """One request at a time (public servers limit slots per IP). Tries the mirrors in order,
+        retries once, and gives up after a total time budget so a tool call never hangs for minutes."""
+        if "[timeout:" not in ql:
+            ql = ql.replace("[out:json]", "[out:json][timeout:20]", 1)
         last_error = "no attempt made"
-        timeout = aiohttp.ClientTimeout(total=40)
+        timeout = aiohttp.ClientTimeout(total=22)
+        started = time.monotonic()
         async with self._overpass_lock:
             for attempt in range(attempts):
                 for url in OVERPASS_ENDPOINTS:
+                    if time.monotonic() - started > OVERPASS_BUDGET_S:
+                        raise Exception(f"Overpass too slow, gave up after {OVERPASS_BUDGET_S} s ({last_error})")
                     try:
                         async with self.session.post(url, data={"data": ql}, timeout=timeout) as response:
                             if response.status == 200:
                                 return await response.json()
+                            if 400 <= response.status < 500 and response.status != 429:
+                                detail = (await response.text())[:200].replace("\n", " ")
+                                raise ValueError(f"Overpass rejected the query (HTTP {response.status}): {detail}")
                             last_error = f"{url} answered HTTP {response.status}"
                     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                         last_error = f"{url}: {type(e).__name__}"
-                await asyncio.sleep(2 * (attempt + 1))
+                await asyncio.sleep(2)
         raise Exception(f"Overpass not available ({last_error})")
 
     async def _overpass_name_search(self, query: str, viewbox: Tuple[float, float, float, float],
@@ -322,8 +340,6 @@ class OSMClient:
         )
         
         # Build Overpass query
-        overpass_url = "https://overpass-api.de/api/interpreter"
-        
         # Default to common POI types if none specified
         if not categories:
             categories = ["amenity", "shop", "tourism", "leisure"]
@@ -331,24 +347,19 @@ class OSMClient:
         # Build tag filters
         tag_filters = []
         for category in categories:
-            tag_filters.append(f'node["{category}"]({{bbox}});')
+            tag_filters.append(f'node["{_safe_osm_key(category)}"]({{bbox}});')
         
         query = f"""
         [out:json];
         (
             {" ".join(tag_filters)}
         );
-        out body;
+        out center tags;
         """
         
         query = query.replace("{bbox}", f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}")
         
-        async with self.session.post(overpass_url, data={"data": query}) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data.get("elements", [])
-            else:
-                raise Exception(f"Failed to get nearby POIs: {response.status}")
+        return (await self._overpass_post(query)).get("elements", [])
 
     async def search_features_by_category(self, 
                                          bbox: Tuple[float, float, float, float],
@@ -358,12 +369,11 @@ class OSMClient:
         if not self.session:
             raise RuntimeError("OSM client not connected")
         
-        overpass_url = "https://overpass-api.de/api/interpreter"
-        
         # Build query for specified category and subcategories
+        category = _safe_osm_key(category)
         if subcategories:
-            subcategory_filters = " or ".join([f'"{category}"="{sub}"' for sub in subcategories])
-            query_filter = f'({subcategory_filters})'
+            values = "|".join(_safe_osm_key(sub) for sub in subcategories)
+            query_filter = f'"{category}"~"^({values})$"'
         else:
             query_filter = f'"{category}"'
         
@@ -374,15 +384,10 @@ class OSMClient:
           way[{query_filter}]({bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]});
           relation[{query_filter}]({bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]});
         );
-        out body;
+        out center tags;
         """
         
-        async with self.session.post(overpass_url, data={"data": query}) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data.get("elements", [])
-            else:
-                raise Exception(f"Failed to search features by category: {response.status}")
+        return (await self._overpass_post(query)).get("elements", [])
 
 # Create application context
 @dataclass
@@ -1055,18 +1060,16 @@ async def find_schools_nearby(
     )
     
     # Build Overpass query for educational institutions
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    
     # Create query for amenity=school and other education-related tags
     education_filters = [
-        'node["amenity"="school"]({{bbox}});',
-        'way["amenity"="school"]({{bbox}});',
-        'node["amenity"="university"]({{bbox}});',
-        'way["amenity"="university"]({{bbox}});',
-        'node["amenity"="kindergarten"]({{bbox}});',
-        'way["amenity"="kindergarten"]({{bbox}});',
-        'node["amenity"="college"]({{bbox}});',
-        'way["amenity"="college"]({{bbox}});'
+        'node["amenity"="school"]({bbox});',
+        'way["amenity"="school"]({bbox});',
+        'node["amenity"="university"]({bbox});',
+        'way["amenity"="university"]({bbox});',
+        'node["amenity"="kindergarten"]({bbox});',
+        'way["amenity"="kindergarten"]({bbox});',
+        'node["amenity"="college"]({bbox});',
+        'way["amenity"="college"]({bbox});'
     ]
     
     query = f"""
@@ -1074,18 +1077,12 @@ async def find_schools_nearby(
     (
         {" ".join(education_filters)}
     );
-    out body;
+    out center tags;
     """
     
     query = query.replace("{bbox}", f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}")
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(overpass_url, data={"data": query}) as response:
-            if response.status == 200:
-                data = await response.json()
-                schools = data.get("elements", [])
-            else:
-                raise Exception(f"Failed to find schools: {response.status}")
+    schools = (await osm_client._overpass_post(query)).get("elements", [])
     
     # Process and filter results
     results = []
@@ -1311,26 +1308,18 @@ async def find_ev_charging_stations(
     )
     
     # Build Overpass query for EV charging stations
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    
     query = f"""
     [out:json];
     (
         node["amenity"="charging_station"]({{bbox}});
         way["amenity"="charging_station"]({{bbox}});
     );
-    out body;
+    out center tags;
     """
     
     query = query.replace("{bbox}", f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}")
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(overpass_url, data={"data": query}) as response:
-            if response.status == 200:
-                data = await response.json()
-                stations = data.get("elements", [])
-            else:
-                raise Exception(f"Failed to find charging stations: {response.status}")
+    stations = (await osm_client._overpass_post(query)).get("elements", [])
     
     # Process and filter results
     results = []
@@ -1514,8 +1503,6 @@ async def analyze_neighborhood(
         )
         
         # Build Overpass query
-        overpass_url = "https://overpass-api.de/api/interpreter"
-        
         # Create query for category tags
         tag_filters = []
         for tag in category["tags"]:
@@ -1528,21 +1515,14 @@ async def analyze_neighborhood(
         (
             {" ".join(tag_filters)}
         );
-        out body;
+        out center tags;
         """
         
         query = query.replace("{bbox}", f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}")
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(overpass_url, data={"data": query}) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        features = data.get("elements", [])
-                    else:
-                        ctx.warning(f"Failed to analyze {category['name']}: {response.status}")
-                        features = []
-                        
+            features = (await osm_client._overpass_post(query)).get("elements", [])
+
             # Process and calculate metrics
             feature_list = []
             distances = []
@@ -1713,8 +1693,6 @@ async def find_parking_facilities(
     )
     
     # Build Overpass query for parking facilities
-    overpass_url = "https://overpass-api.de/api/interpreter"
-    
     query = f"""
     [out:json];
     (
@@ -1722,18 +1700,12 @@ async def find_parking_facilities(
         way["amenity"="parking"]({{bbox}});
         relation["amenity"="parking"]({{bbox}});
     );
-    out body;
+    out center tags;
     """
     
     query = query.replace("{bbox}", f"{bbox[1]},{bbox[0]},{bbox[3]},{bbox[2]}")
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(overpass_url, data={"data": query}) as response:
-            if response.status == 200:
-                data = await response.json()
-                parking_facilities = data.get("elements", [])
-            else:
-                raise Exception(f"Failed to find parking facilities: {response.status}")
+    parking_facilities = (await osm_client._overpass_post(query)).get("elements", [])
     
     # Process and filter results
     results = []
@@ -1977,7 +1949,7 @@ async def create_route_printout(
     language: str = "en",
     title: Optional[str] = None,
     width: int = 1000,
-    height: int = 760,
+    height: int = 700,
     save_map_png: bool = True
 ) -> Dict[str, Any]:
     """
@@ -2046,36 +2018,51 @@ async def create_route_printout(
         os.close(handle)
         map_path = Path(tmp_name)
 
-    detail_path: Optional[Path] = None
+    detail_paths: List[Path] = []
     try:
         rendered = await maprender.render(
             str(map_path), width=width, height=height, markers=markers, route=route.get("geometry")
         )
 
-        # numbered points that overlap at this zoom get a zoomed-in detail map
+        # numbered points that overlap at this zoom get zoomed-in detail maps, one per cluster
         placed = [(m, maprender.world_px(m["latitude"], m["longitude"], rendered["zoom"])) for m in markers]
-        crowded_set = set()
+        parent = list(range(len(placed)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
         for i in range(len(placed)):
             for j in range(i + 1, len(placed)):
                 if math.hypot(placed[i][1][0] - placed[j][1][0], placed[i][1][1] - placed[j][1][1]) < 28:
-                    crowded_set.update((i, j))
-        crowded = sorted(crowded_set)
+                    parent[find(i)] = find(j)
+        groups: Dict[int, List[int]] = {}
+        for i in range(len(placed)):
+            groups.setdefault(find(i), []).append(i)
+        clusters = [sorted(g) for g in groups.values() if len(g) >= 2][:3]
+
         detail_size = (1000, 420)
-        if len(crowded) >= 2:
-            points = [(placed[i][0]["latitude"], placed[i][0]["longitude"]) for i in crowded]
+        details = []
+        for number, cluster in enumerate(sorted(clusters), start=1):
+            points = [(placed[i][0]["latitude"], placed[i][0]["longitude"]) for i in cluster]
             lats, lons = [p[0] for p in points], [p[1] for p in points]
             if save_map_png:
-                detail_path = out.with_name(out.stem + "_detail.png")
+                detail_path = out.with_name(f"{out.stem}_detail{number}.png")
             else:
                 handle, tmp_name = tempfile.mkstemp(suffix=".png")
                 os.close(handle)
                 detail_path = Path(tmp_name)
+            detail_paths.append(detail_path)
             await maprender.render(
                 str(detail_path), width=detail_size[0], height=detail_size[1],
                 bbox=(min(lats), min(lons), max(lats), max(lons)),
                 zoom=min(maprender.fit_zoom(points, detail_size[0], detail_size[1], padding=70), 18),
                 markers=markers, route=route.get("geometry"),
             )
+            details.append({"path": str(detail_path), "size": detail_size,
+                            "labels": [placed[i][0]["text"] for i in cluster]})
 
         waypoints = route_data.get("waypoints", [])
         snap = waypoints[-1].get("distance") if waypoints else None
@@ -2093,18 +2080,18 @@ async def create_route_printout(
             routesheet.build_pdf, str(out), str(map_path), (width, height), label, language, mode,
             route.get("distance", 0.0), route.get("duration", 0.0),
             info(start), {**info(end), "note": (note + " " + info(end)["note"]).strip()}, steps,
-            str(detail_path) if detail_path else None, detail_size if detail_path else None,
+            details,
         )
     finally:
         if not save_map_png:
             map_path.unlink(missing_ok=True)
-            if detail_path:
+            for detail_path in detail_paths:
                 detail_path.unlink(missing_ok=True)
 
     return {
         "pdf_path": str(out.resolve()),
         "map_png_path": rendered["output_path"] if save_map_png else None,
-        "detail_map_png_path": str(detail_path.resolve()) if detail_path and save_map_png else None,
+        "detail_map_png_paths": [str(d.resolve()) for d in detail_paths] if save_map_png else [],
         "mode": mode,
         "distance_m": route.get("distance"),
         "duration_s": route.get("duration"),

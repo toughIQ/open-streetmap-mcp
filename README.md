@@ -67,7 +67,7 @@ The server implements several geospatial tools:
 - `explore_area`: Get comprehensive data about a neighborhood
 - `find_schools_nearby`: Locate educational institutions near a specific location
 - `find_place`: Find a place by name or address and check its address (street, house number, postcode, town), limited to an optional area with a fuzzy name fallback
-- `create_route_printout`: One call for a printable A4 PDF route sheet: colored map with numbered turn points, checked addresses of start and destination, step-by-step directions (en or de), and an automatic detail map where turn points overlap
+- `create_route_printout`: One call for a printable A4 PDF route sheet: colored map with numbered turn points, checked addresses of start and destination, step-by-step directions (en or de), and automatic zoomed detail maps (one per cluster, up to 3) where turn points overlap
 - `render_static_map`: Render a map image (PNG/JPEG) from OSM tiles with markers and a route line, saved to a file for PDFs and docs
 - `render_route_map`: Compute a route (car, bike, foot) and save a map image of it
 - `analyze_commute`: Compare transportation options between home and work
@@ -82,6 +82,8 @@ The server implements several geospatial tools:
 - Routing now uses `routing.openstreetmap.de` (separate car, bike and foot profiles) and turn-by-turn steps get readable text.
 - A real User-Agent is sent. Override with `OSM_MCP_USER_AGENT`. Other env vars: `OSM_MCP_TILE_URL`, `OSM_MCP_CACHE_DIR`.
 - Place search for routing is area-aware: `area="Koenigstetten, Austria"` limits results to that place (checked against the address, not just the bounding box, so a scout group in the next village is not picked) and falls back to a fuzzy name search inside the administrative boundary. If nothing is found inside the area it fails instead of guessing elsewhere. Nominatim calls are throttled to 1 per second.
+- All Overpass tools (nearby places, category search, schools, EV charging, parking, neighborhood, place fallback) go through one shared client: User-Agent sent (overpass-api.de answers 406 without one), one request at a time, mirrors tried in order (overpass.openstreetmap.fr first, it was by far the fastest in tests), a 75 s total budget, ways and relations now return a center point (`out center tags`), and OSM keys from tool arguments are validated before they go into a query. Fixed: `search_category` with subcategories built invalid syntax, `find_schools_nearby` had broken bbox placeholders.
+- Cancelled requests get no reply (spec), because opencode drops the whole server on the late "Request cancelled" error of the python SDK.
 - MCP SDK upgraded from 1.3.0 to 1.30.0: with 1.3.0 any `notifications/cancelled` from the client (abort, timeout) killed the whole server process.
 - Dependencies are pinned to exact versions. `constraints.txt` (exported from `uv.lock`) freezes the transitive ones too, because `uv tool install` ignores `uv.lock`. Install
   `uv tool install -c constraints.txt .` (run inside a checkout, non-editable), then use `osm-mcp-server` as the MCP command.

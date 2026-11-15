@@ -45,7 +45,7 @@ T = {
         "from": "From", "to": "To", "distance": "Distance", "time": "Time (estimate)",
         "no": "No.", "directions": "Directions", "walk": "Distance to next point",
         "minutes": "about {n} min",
-        "detail": "Detail of the crowded section (numbers as above)",
+        "detail": "Detail view of the crowded section, points {labels} (numbers as above)",
         "arrival_street": "The route ends on {street}, the nearest street to the destination.",
         "snap": "The destination is about {n} m from the end of the route.",
         "no_housenumber": "no house number in OpenStreetMap",
@@ -68,7 +68,7 @@ T = {
         "from": "Von", "to": "Nach", "distance": "Strecke", "time": "Dauer (Schätzung)",
         "no": "Nr.", "directions": "Wegbeschreibung", "walk": "Strecke bis zum nächsten Punkt",
         "minutes": "ca. {n} Min.",
-        "detail": "Detailausschnitt des engen Abschnitts (Nummern wie oben)",
+        "detail": "Detailausschnitt des engen Abschnitts, Punkte {labels} (Nummern wie oben)",
         "arrival_street": "Die Route endet in der {street}, der nächsten Straße zum Ziel.",
         "snap": "Das Ziel liegt etwa {n} m vom Routenende entfernt.",
         "no_housenumber": "keine Hausnummer in OpenStreetMap",
@@ -146,6 +146,17 @@ def build_steps(route: Dict[str, Any], lang: str = "en", mode: str = "foot") -> 
                 "text": describe_step(s, lang, mode),
             })
 
+    # OSRM reports "enter roundabout" and "exit roundabout" as two steps, show them as one
+    joined: List[Dict[str, Any]] = []
+    for step in raw:
+        if (step["kind"] in ("exit roundabout", "exit rotary") and joined
+                and joined[-1]["kind"] in ("roundabout", "rotary", "roundabout turn")):
+            joined[-1]["distance"] += step["distance"]
+            joined[-1]["duration"] += step["duration"]
+            continue
+        joined.append(step)
+    raw = joined
+
     def tiny(x: Dict[str, Any]) -> bool:
         return not x["name"] and x["distance"] < 30 and x["kind"] not in ("depart", "arrive")
 
@@ -209,8 +220,7 @@ def build_pdf(
     start: Dict[str, str],
     end: Dict[str, str],
     steps: List[Dict[str, Any]],
-    detail_image: Optional[str] = None,
-    detail_size: Optional[tuple] = None,
+    details: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     t = T[lang]
     base = getSampleStyleSheet()
@@ -257,16 +267,6 @@ def build_pdf(
         ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     story += [places, Spacer(1, 5 * mm)]
-    if detail_image and detail_size:
-        story += [
-            KeepTogether([
-                Paragraph(_txt(t["detail"]), small),
-                Spacer(1, 1.5 * mm),
-                RLImage(detail_image, width=width, height=width * detail_size[1] / detail_size[0]),
-            ]),
-            Spacer(1, 5 * mm),
-        ]
-
     rows = [[Paragraph(f"<b>{_txt(t['no'])}</b>", body), Paragraph(f"<b>{_txt(t['directions'])}</b>", body),
              Paragraph(f"<b>{_txt(t['walk'])}</b>", body)]]
     styles = [
@@ -283,7 +283,17 @@ def build_pdf(
         styles.append(("BACKGROUND", (0, idx), (0, idx), colors.HexColor(color)))
     steps_table = Table(rows, colWidths=[14 * mm, 126 * mm, 40 * mm], repeatRows=1)
     steps_table.setStyle(TableStyle(styles))
-    story.append(steps_table)
+    story += [steps_table, Spacer(1, 6 * mm)]
+
+    for detail in details or []:
+        story += [
+            KeepTogether([
+                Paragraph(_txt(t["detail"].format(labels=", ".join(detail["labels"]))), small),
+                Spacer(1, 1.5 * mm),
+                RLImage(detail["path"], width=width, height=width * detail["size"][1] / detail["size"][0]),
+            ]),
+            Spacer(1, 5 * mm),
+        ]
 
     doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm,
                             topMargin=14 * mm, bottomMargin=16 * mm, title=title, author="osm-mcp-server")
